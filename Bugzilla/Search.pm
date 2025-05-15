@@ -108,7 +108,9 @@ use Time::HiRes qw(gettimeofday tv_interval);
 #############
 
 # BMO - product aliases for searching
-use constant PRODUCT_ALIASES => {};
+use constant PRODUCT_ALIASES => {
+  'Fenix' => 'Firefox for Android',
+};
 
 # When doing searches, NULL datetimes are treated as this date.
 use constant EMPTY_DATETIME => '1970-01-01 00:00:00';
@@ -870,19 +872,9 @@ sub data {
     '_no_security_check' => 1
   );
 
-  # Add some user information to the SQL so we can pinpoint where some
-  # slow running queries originate and help to refine the searches.
-  my $sql_user_info
-    = ' /* userid: '
-    . Bugzilla->user->id
-    . ' useragent: '
-    . Bugzilla->cgi->user_agent
-    . ' query: '
-    . Bugzilla->cgi->canonicalize_query() . ' */ ';
-
   $start_time = [gettimeofday()];
   $sql        = $search->_sql;
-  my $unsorted_data = $dbh->selectall_arrayref($sql . $sql_user_info);    # Add extra info for logging purposes
+  my $unsorted_data = $dbh->selectall_arrayref($sql);
   push(@extra_data, {sql => $sql, time => tv_interval($start_time)});
 
   # Let's sort the data. We didn't do it in the query itself because
@@ -965,11 +957,24 @@ sub _sql {
     $limit    = '';
   }
 
-  my $query = <<END;
+  # Add some user information to the SQL so we can pinpoint where some
+  # slow running queries originate and help to refine the searches.
+  my $cgi          = Bugzilla->cgi;
+  my $user_id      = $self->{user}->id;
+  my $remote_ip    = remote_ip();
+  my $user_agent   = $cgi->user_agent || $cgi->script_name;
+  my $query_string = $cgi->canonicalize_query();
+  my $query        = <<END;
 SELECT $select
   FROM $from
  WHERE $where
 $group_by$order_by$limit
+/*
+user-id: $user_id
+remote-ip: $remote_ip
+user-agent: $user_agent
+query-string: $query_string
+*/
 END
   $self->{sql} = $query;
   return $self->{sql};

@@ -17,6 +17,7 @@ use Bugzilla::Bug;
 use Bugzilla::Constants;
 use Bugzilla::Flag;
 use Bugzilla::Group;
+use Bugzilla::Logging;
 use Bugzilla::User;
 use Bugzilla::Extension::Review::FlagStateActivity;
 
@@ -29,6 +30,7 @@ use LWP::UserAgent::Determined;
 use Mojo::File qw(path);
 use Mojo::JSON qw(decode_json encode_json false true);
 use Mojo::Util qw(getopt);
+use Try::Tiny;
 
 # BigQuery API cannot handle payloads larger than 10MB so
 # we will send data in blocks.
@@ -37,11 +39,19 @@ use constant API_BLOCK_COUNT => 1000;
 # Products which we should not send data to ETL such as Legal, etc.
 use constant EXCLUDE_PRODUCTS => ('Legal',);
 
+# Log levels
+use constant DEBUG_OUTPUT => 1;
+
 Bugzilla->usage_mode(USAGE_MODE_CMDLINE);
 getopt
   't|test'            => \my $test,
-  'v|verbose'         => \my $verbose,
-  's|snapshot-date=s' => \my $snapshot_date;
+  'q|quiet'           => \my $quiet,
+  'd|debug'           => \my $debug,
+  's|snapshot-date=s' => \my $snapshot_date,
+  'n|no-cache=s'      => \my @no_cache;
+
+# Create a hash for faster checking later
+my %no_cache = map { $_ => 1 } @no_cache;
 
 # Sanity checks
 Bugzilla->params->{bmo_etl_enabled} || die "BMO ETL not enabled.\n";
@@ -130,7 +140,7 @@ sub process_bugs {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM bugs');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name");
 
   my $sth
     = $dbh->prepare(
@@ -143,13 +153,13 @@ sub process_bugs {
     $sth->execute(API_BLOCK_COUNT, $last_offset);
 
     while (my ($id, $mod_time) = $sth->fetchrow_array()) {
-      print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
+      logger("Processing id $id with mod_time of $mod_time.");
 
       # First check to see if we have a cached version with the same modification date
       my $data = get_cache($id, $table_name, $mod_time);
+
       if (!$data) {
-        print "$table_name id $id with time $mod_time not found in cache.\n"
-          if $verbose;
+        logger("$table_name id $id with time $mod_time not found in cache.", DEBUG_OUTPUT);
 
         my $obj = Bugzilla::Bug->new($id);
 
@@ -240,7 +250,7 @@ sub process_attachments {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM attachments');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth
     = $dbh->prepare(
@@ -253,13 +263,13 @@ sub process_attachments {
     $sth->execute(API_BLOCK_COUNT, $last_offset);
 
     while (my ($id, $mod_time) = $sth->fetchrow_array()) {
-      print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
+      logger("Processing id $id with mod_time of $mod_time.");
 
       # First check to see if we have a cached version with the same modification date
       my $data = get_cache($id, $table_name, $mod_time);
+
       if (!$data) {
-        print "$table_name id $id with time $mod_time not found in cache.\n"
-          if $verbose;
+        logger("$table_name id $id with time $mod_time not found in cache." , DEBUG_OUTPUT);
 
         my $obj = Bugzilla::Attachment->new($id);
 
@@ -306,7 +316,7 @@ sub process_flags {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM flags');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth = $dbh->prepare(
     'SELECT id, modification_date FROM flags ORDER BY id LIMIT ? OFFSET ?');
@@ -317,13 +327,13 @@ sub process_flags {
     $sth->execute(API_BLOCK_COUNT, $last_offset);
 
     while (my ($id, $mod_time) = $sth->fetchrow_array()) {
-      print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
+      logger("Processing id $id with mod_time of $mod_time.");
 
       # First check to see if we have a cached version with the same modification date
       my $data = get_cache($id, $table_name, $mod_time);
+
       if (!$data) {
-        print "$table_name id $id with time $mod_time not found in cache.\n"
-          if $verbose;
+        logger("$table_name id $id with time $mod_time not found in cache." , DEBUG_OUTPUT);
 
         my $obj = Bugzilla::Flag->new($id);
 
@@ -333,6 +343,7 @@ sub process_flags {
         }
 
         $data = {
+          id            => $obj->id,
           attachment_id => $obj->attach_id || undef,
           bug_id        => $obj->bug_id,
           creation_ts   => $obj->creation_date,
@@ -372,7 +383,7 @@ sub process_flag_state_activity {
     'SELECT COUNT(*) FROM flag_state_activity WHERE status = \'X\' AND flag_when LIKE \''
       . $snapshot_date
       . ' %\'');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth
     = $dbh->prepare(
@@ -386,13 +397,13 @@ sub process_flag_state_activity {
     $sth->execute(API_BLOCK_COUNT, $last_offset);
 
     while (my ($id, $mod_time) = $sth->fetchrow_array()) {
-      print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
+      logger("Processing id $id with mod_time of $mod_time.");
 
       # First check to see if we have a cached version with the same modification date
       my $data = get_cache($id, $table_name, $mod_time);
+
       if (!$data) {
-        print "$table_name id $id with time $mod_time not found in cache.\n"
-          if $verbose;
+        logger("$table_name id $id with time $mod_time not found in cache.", DEBUG_OUTPUT);
 
         my $obj = Bugzilla::Extension::Review::FlagStateActivity->new($id);
 
@@ -440,10 +451,10 @@ sub process_tracking_flags {
             ON tracking_flags_bugs.tracking_flag_id = tracking_flags.id
       ORDER BY tracking_flags_bugs.bug_id'
   );
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth = $dbh->prepare(
-    'SELECT tracking_flags.name, tracking_flags_bugs.bug_id, tracking_flags_bugs.value
+    'SELECT tracking_flags_bugs.id, tracking_flags.name, tracking_flags_bugs.bug_id, tracking_flags_bugs.value
       FROM tracking_flags_bugs
            JOIN tracking_flags
            ON tracking_flags_bugs.tracking_flag_id = tracking_flags.id
@@ -455,14 +466,14 @@ sub process_tracking_flags {
 
     $sth->execute(API_BLOCK_COUNT, $last_offset);
 
-    while (my ($name, $bug_id, $value) = $sth->fetchrow_array()) {
+    while (my ($id, $name, $bug_id, $value) = $sth->fetchrow_array()) {
       if ($excluded_bugs{$bug_id}) {
         $count++;
         next;
       }
 
       # Standard fields
-      my $data = {bug_id => $bug_id};
+      my $data = {id => $id, bug_id => $bug_id};
 
       # Fields that require custom values based on other criteria
       if (exists $private_bugs{$bug_id}) {
@@ -492,7 +503,7 @@ sub process_keywords {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM keywords');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth = $dbh->prepare(
     'SELECT bug_id, keyworddefs.name
@@ -537,7 +548,7 @@ sub process_see_also {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM bug_see_also');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth
     = $dbh->prepare(
@@ -587,7 +598,7 @@ sub process_users {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM profiles');
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $sth
     = $dbh->prepare(
@@ -600,7 +611,7 @@ sub process_users {
     $sth->execute(API_BLOCK_COUNT, $last_offset);
 
     while (my ($id, $mod_time) = $sth->fetchrow_array()) {
-      print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
+      logger("Processing id $id with mod_time of $mod_time.");
 
       # Set the mod time to an arbitrary value for caching purposes if its
       # real mod time is not yet been set to a real value.
@@ -608,9 +619,9 @@ sub process_users {
 
       # First check to see if we have a cached version with the same modification date
       my $data = get_cache($id, $table_name, $mod_time);
+
       if (!$data) {
-        print "$table_name id $id with time $mod_time not found in cache.\n"
-          if $verbose;
+        logger("$table_name id $id with time $mod_time not found in cache.", DEBUG_OUTPUT);
 
         my $obj = Bugzilla::User->new($id);
 
@@ -652,7 +663,7 @@ sub process_two_columns {
   my $last_offset = 0;
 
   my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM ' . $table_name);
-  print "Processing $total $table_name.\n" if $verbose;
+  logger("Processing $total $table_name.");
 
   my $columns_string = join ', ', @{$column_names};
   my $order_by       = $column_names->[0];
@@ -671,7 +682,7 @@ sub process_two_columns {
         next;
       }
 
-      print "Processing values $value1, $value2 for $table_name.\n" if $verbose;
+      logger("Processing values $value1, $value2 for $table_name.");
 
       my $data = {$data_names->[0] => $value1, $data_names->[1] => $value2,};
 
@@ -690,8 +701,14 @@ sub process_two_columns {
 sub get_cache {
   my ($id, $table, $timestamp) = @_;
 
-  print "Retreiving data from $table for $id with time $timestamp.\n" if $verbose;
+  if ($no_cache{$table}) {
+    logger("Retrieving cached data is disabled for $table.");
+    return undef;
+  }
 
+  logger("Retreiving data from $table for $id with time $timestamp.", DEBUG_OUTPUT);
+
+  try {
   # Retrieve compressed JSON from cache table if it exists
   my $gzipped_data = $dbh->selectrow_array(
     'SELECT data FROM bmo_etl_cache WHERE id = ? AND table_name = ? AND snapshot_date = ?',
@@ -706,12 +723,23 @@ sub get_cache {
     die "gunzip failed: $GunzipError\n";
   }
   return decode_json($data);
+  }
+  catch {
+    # Log the failure and return undef
+    WARN("ERROR: Unable to retrieve cached data from database: $_");
+    return undef;
+  }
 }
 
 sub store_cache {
   my ($id, $table, $timestamp, $data) = @_;
 
-  print "Storing data into $table for $id with time $timestamp.\n" if $verbose;
+  if ($no_cache{$table}) {
+    logger("Storing cached data is disabled for $table.");
+    return undef;
+  }
+
+  logger("Storing data into $table for $id with time $timestamp.", DEBUG_OUTPUT);
 
   # Encode the perl data into JSON
   $data = encode_json($data);
@@ -726,24 +754,27 @@ sub store_cache {
   # We need to use the main DB for write operations
   my $main_dbh = Bugzilla->dbh_main;
 
-  # Clean out outdated JSON
-  $main_dbh->do('DELETE FROM bmo_etl_cache WHERE id = ? AND table_name = ?',
-    undef, $id, $table);
+  try {
+    # Clean out outdated JSON
+    $main_dbh->do('DELETE FROM bmo_etl_cache WHERE id = ? AND table_name = ?',
+      undef, $id, $table);
 
-  # Enter new cached JSON
-  $main_dbh->do(
-    'INSERT INTO bmo_etl_cache (id, table_name, snapshot_date, data) VALUES (?, ?, ?, ?)',
-    undef, $id, $table, $timestamp, $gzipped_data
-  );
+    # Enter new cached JSON
+    $main_dbh->do(
+      'INSERT INTO bmo_etl_cache (id, table_name, snapshot_date, data) VALUES (?, ?, ?, ?)',
+      undef, $id, $table, $timestamp, $gzipped_data
+    );
+  }
+  catch {
+    # Log the failure
+    WARN("ERROR: Unable to store cache data in database: $_");
+  }
 }
 
 sub send_data {
   my ($table, $all_rows, $current_count) = @_;
 
-  print 'Sending '
-    . scalar @{$all_rows}
-    . " rows to table $table using BigQuery API\n"
-    if $verbose;
+  logger('Sending ' . scalar @{$all_rows} . " rows to table $table using BigQuery API");
 
   # Add the same snapshot date to every row sent
   foreach my $row (@{$all_rows}) {
@@ -764,7 +795,7 @@ sub send_data {
       . $table . '-'
       . $current_count . '.json';
 
-    print "Writing data to $filename\n" if $verbose;
+    logger("Writing data to $filename.");
 
     my $fh = path($filename)->open('>>');
     print $fh encode_json($big_query) . "\n";
@@ -787,14 +818,22 @@ sub send_data {
   my $full_path = sprintf 'projects/%s/datasets/%s/tables/%s/insertAll',
     $project_id, $dataset_id, $table;
 
-  print "Sending to $base_url/$full_path\n" if $verbose;
+  logger("Sending to $base_url/$full_path", DEBUG_OUTPUT);
 
   my $request = HTTP::Request->new('POST', "$base_url/$full_path", $http_headers);
   $request->header('Content-Type' => 'application/json');
+
+  logger('Encoding content into JSON.', DEBUG_OUTPUT);
+
   $request->content(encode_json($big_query));
 
+  logger('Sending request', DEBUG_OUTPUT);
+
   my $response = $ua->request($request);
-  my $result   = decode_json($response->content);
+
+  logger($response->content, DEBUG_OUTPUT);
+
+  my $result = decode_json($response->content);
 
   if (!$response->is_success
     || (exists $result->{insertErrors} && @{$result->{insertErrors}}))
@@ -811,15 +850,18 @@ sub _get_access_token {
   state $access_token;    # We should only need to get this once
   state $token_expiry;
 
+  logger('Checking for acess token', DEBUG_OUTPUT);
+
   # If we already have a token and it has not expired yet, just return it
   if ($access_token && time < $token_expiry) {
+    logger('Previous access token found', DEBUG_OUTPUT);
     return $access_token;
   }
 
-# Google Kubernetes allows for the use of Workload Identity. This allows
-# us to link two service accounts together and give special access for applications
-# running under Kubernetes. We use the special access to get an OAuth2 access_token
-# that can then be used for accessing the the Google API such as BigQuery.
+  # Google Kubernetes allows for the use of Workload Identity. This allows
+  # us to link two service accounts together and give special access for applications
+  # running under Kubernetes. We use the special access to get an OAuth2 access_token
+  # that can then be used for accessing the the Google API such as BigQuery.
   my $url
     = sprintf
     'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/%s/token',
@@ -841,6 +883,8 @@ sub _get_access_token {
   $access_token = $result->{access_token};
   $token_expiry = time + $result->{expires_in};
 
+  logger('New access token returned', DEBUG_OUTPUT);
+
   return $access_token;
 }
 
@@ -849,25 +893,35 @@ sub _get_access_token {
 sub check_and_set_lock {
   return if $test;    # No need if just dumping test files
 
+  logger('Checking for previous lock or setting new one', DEBUG_OUTPUT);
+
   my $dbh_main = Bugzilla->dbh_main;
+
+  # Clear out any locks that are greater than 24h old
+  $dbh_main->do('DELETE FROM bmo_etl_locked WHERE creation_ts < '
+      . $dbh_main->sql_date_math('NOW()', '-', 24, 'HOUR'));
+
+  # Now check for any pre-existing locks and do not proceed if one found
   my $locked = $dbh_main->selectrow_array('SELECT COUNT(*) FROM bmo_etl_locked');
   if ($locked) {
     die "Another process has set a lock. Exiting\n";
   }
-  $dbh_main->do('INSERT INTO bmo_etl_locked VALUES (?)', undef, 'locked');
+
+  logger('Previous lock not found. Setting new one.', DEBUG_OUTPUT);
+
+  $dbh_main->do('INSERT INTO bmo_etl_locked (value, creation_ts) VALUES (?, NOW())', undef, 'locked');
 }
 
 # Delete lock from bmo_etl_locked
 sub delete_lock {
-  print "Deleting lock in database\n" if $verbose;
+  logger("Deleting lock in database.");
   Bugzilla->dbh_main->do('DELETE FROM bmo_etl_locked');
 }
 
 sub check_for_duplicates {
   return if $test;    # no need if just dumping test files
 
-  print "Checking for duplicate data for snapshot date $snapshot_date\n"
-    if $verbose;
+  logger("Checking for duplicate data for snapshot date $snapshot_date.");
 
   my $http_headers = HTTP::Headers->new;
 
@@ -879,7 +933,7 @@ sub check_for_duplicates {
 
   my $full_path = "projects/$project_id/queries";
 
-  print "Querying $base_url/$full_path\n" if $verbose;
+  logger("Querying $base_url/$full_path", DEBUG_OUTPUT);
 
   my $query = {
     query =>
@@ -891,13 +945,15 @@ sub check_for_duplicates {
   $request->header('Content-Type' => 'application/json');
   $request->content(encode_json($query));
 
-  print encode_json($query) . "\n" if $verbose;
+  logger(encode_json($query), DEBUG_OUTPUT);
 
   my $res = $ua->request($request);
   if (!$res->is_success) {
     delete_lock();
     die 'Google Big Query query failure: ' . $res->content . "\n";
   }
+
+  logger($res->content, DEBUG_OUTPUT);
 
   my $result = decode_json($res->content);
 
@@ -912,6 +968,8 @@ sub check_for_duplicates {
 
 sub get_multi_group_value {
   my ($bug) = @_;
+
+  logger('Checking for multi group values.', DEBUG_OUTPUT);
 
   my $smallest_group_name  = undef;
   my $smallest_group_count = 0;
@@ -928,7 +986,22 @@ sub get_multi_group_value {
     }
   }
 
+  logger("Smallest group members: $smallest_group_name") if $smallest_group_name;
+
   return $smallest_group_name;
+}
+
+sub logger {
+  my ($message, $level) = @_;
+
+  # Skip if -q or --quiet was specified
+  return if $quiet;
+
+  # Skip if --debug was not specified and this is a DEBUG level entry
+  return if (defined $level && $level == DEBUG_OUTPUT && !$debug);
+
+  # Otherwise just print
+  print time() . ": $message\n";
 }
 
 1;

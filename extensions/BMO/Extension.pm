@@ -1391,12 +1391,15 @@ sub db_schema_abstract_schema {
       table_name    => {TYPE => 'VARCHAR(100)', NOTNULL => 1,},
       data          => {TYPE => 'LONGBLOB',     NOTNULL => 1,},
     ],
-    INDEXES =>
-      [bmo_etl_cache_idx => {FIELDS => ['id', 'snapshot_date', 'table_name']}],
+    INDEXES => [
+      bmo_etl_cache_idx      => {FIELDS => ['id', 'snapshot_date', 'table_name']},
+      bmo_etl_cache_uniq_idx => {FIELDS => ['id', 'table_name'], TYPE => 'UNIQUE'}
+    ],
   };
   $args->{schema}->{bmo_etl_locked} = {
     FIELDS => [
-      value => {TYPE => 'VARCHAR(20)', NOTNULL => 1,},
+      value       => {TYPE => 'VARCHAR(20)', NOTNULL => 1,},
+      creation_ts => {TYPE => 'DATETIME',},
     ],
   };
 }
@@ -1585,6 +1588,16 @@ sub install_update_db {
       type        => FIELD_TYPE_BOOLEAN,
     });
   }
+
+  # Add bmo_etl_locked.creation_ts column
+  if (!$dbh->bz_column_info('bmo_etl_locked', 'creation_ts')) {
+    $dbh->bz_add_column('bmo_etl_locked',
+      'creation_ts' => {TYPE => 'DATETIME'});
+  }
+
+  # Add unique index for id and table name for bmo_etl_cache
+  $dbh->bz_add_index('bmo_etl_cache', 'bmo_etl_cache_uniq_idx',
+    {FIELDS => ['id', 'table_name'], TYPE => 'UNIQUE'});
 }
 
 # return the Bugzilla::Field::Choice object for the specified field and value.
