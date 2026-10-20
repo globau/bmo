@@ -238,7 +238,11 @@ sub render_comment {
     ? Bugzilla->markdown->render_html($params->{text}, $bug)
     : Bugzilla::Template::quoteUrls($params->{text}, $bug);
 
-  return {html => $html};
+  my $result = {html => $html};
+  Bugzilla::Hook::process('webservice_bug_render_comment',
+    {webservice => $self, bug => $bug, params => $params, result => $result});
+
+  return $result;
 }
 
 # Helper for every method that returns comments. Fetches the revision metadata
@@ -4709,6 +4713,12 @@ C<int> The ID of the bug to render the comment against.
 =item B<Returns>
 
 C<html> containing the HTML rendering.
+
+Extensions can add params and return values through the
+C<webservice_bug_render_comment> hook. When C<id> is given, the Needinfo
+extension accepts C<include_mentions> and C<mention_is_private> and returns
+C<mentions>, an array of C<nick>/C<name> hashes for the users that saving the
+comment on that bug would CC and needinfo.
 
 =item B<Errors>
 
